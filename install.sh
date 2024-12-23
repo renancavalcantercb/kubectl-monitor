@@ -1,32 +1,39 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 set -e
 
-OS=$(uname | tr '[:upper:]' '[:lower:]')
-ARCH=$(uname -m)
+VERSION="v1.0.3"
 
-if [[ "$ARCH" == "x86_64" ]]; then
-    ARCH="amd64"
-elif [[ "$ARCH" == "arm64" ]] || [[ "$ARCH" == "aarch64" ]]; then
-    ARCH="arm64"
-else
-    echo "Unsupported architecture: $ARCH"
+REPO="renancavalcantercb/kubectl-monitor"
+
+OS="$(uname | tr '[:upper:]' '[:lower:]')"
+ARCH="$(uname -m)"
+
+case "$OS" in
+  "darwin")
+    BINARY="kubectl-monitor-darwin-amd64"
+    ;;
+  "linux")
+    BINARY="kubectl-monitor-linux-amd64"
+    ;;
+  *)
+    echo "Unsupported OS or script not prepared for: $OS"
     exit 1
-fi
+    ;;
+esac
 
-BINARY="kubectl-monitor-${OS}-${ARCH}"
+INSTALL_PATH="/usr/local/bin"
 
-URL="https://github.com/renancavalcantercb/kubectl-monitor/releases/latest/download/${BINARY}"
+DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${VERSION}/${BINARY}"
 
-DEST_DIR="/usr/local/bin"
+echo "Downloading ${DOWNLOAD_URL} ..."
+curl -sL "$DOWNLOAD_URL" -o "/tmp/${BINARY}"
 
-echo "Downloading ${BINARY} from ${URL}..."
-curl -Lo kubectl-monitor "$URL"
+echo "Copying the binary to ${INSTALL_PATH}/kubectl-monitor ..."
+sudo cp "/tmp/${BINARY}" "${INSTALL_PATH}/kubectl-monitor"
+sudo chmod +x "${INSTALL_PATH}/kubectl-monitor"
+rm -f "/tmp/${BINARY}"
 
-echo "Setting executable permissions..."
-chmod +x kubectl-monitor
-
-echo "Moving to ${DEST_DIR}..."
-sudo mv kubectl-monitor "$DEST_DIR"
-
-echo "Installation complete! You can now use 'kubectl-monitor' as a kubectl plugin."
+echo ""
+echo "Installation completed!"
+echo "You can now run: kubectl-monitor"

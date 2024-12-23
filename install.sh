@@ -2,12 +2,10 @@
 
 set -e
 
-VERSION="v1.0.5"
-
-REPO="renancavalcantercb/kubectl-monitor"
-
 OS="$(uname | tr '[:upper:]' '[:lower:]')"
 ARCH="$(uname -m)"
+
+INSTALL_PATH="/usr/local/bin"
 
 case "$OS" in
   "darwin")
@@ -22,18 +20,15 @@ case "$OS" in
     ;;
 esac
 
-INSTALL_PATH="/usr/local/bin"
+if [ ! -f "bin/$BINARY" ]; then
+  echo "Binary bin/$BINARY not found!"
+  exit 1
+fi
 
-DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${VERSION}/${BINARY}"
-
-echo "Downloading ${DOWNLOAD_URL} ..."
-curl -sL "$DOWNLOAD_URL" -o "/tmp/${BINARY}"
-
-echo "Copying the binary to ${INSTALL_PATH}/kubectl-monitor ..."
-sudo cp "/tmp/${BINARY}" "${INSTALL_PATH}/kubectl-monitor"
-sudo chmod +x "${INSTALL_PATH}/kubectl-monitor"
-rm -f "/tmp/${BINARY}"
+echo "Copying bin/$BINARY to $INSTALL_PATH/kubectl-monitor..."
+sudo cp "bin/$BINARY" "$INSTALL_PATH/kubectl-monitor"
+sudo chmod +x "$INSTALL_PATH/kubectl-monitor"
 
 echo ""
 echo "Installation completed!"
-echo "You can now run: kubectl-monitor"
+echo "Now you can run: kubectl-monitor"

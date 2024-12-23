@@ -16,48 +16,16 @@ Kubectl Monitor is a CLI tool designed to enhance the experience of monitoring K
 - [Go](https://golang.org/doc/install) installed on your system.
 - `kubectl` configured and working.
 
-### Build from Source
+### Installation
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/renancavalcantercb/kubectl-monitor.git
-   cd kubectl-monitor
-   ```
+Run the following command to install Kubectl Monitor:
 
-2. Build the binary:
-   ```bash
-   go build -o kubectl-monitor main.go
-   ```
-
-3. Move the binary to your PATH:
-   ```bash
-   sudo mv kubectl-monitor /usr/local/bin
-   ```
-
-4. Test the tool:
-   ```bash
-   kubectl-monitor --namespace default
-   ```
-
-### Easy Installation Script
-
-For easier installation, use the provided `install.sh` script:
-
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/renancavalcantercb/kubectl-monitor.git
-   cd kubectl-monitor
-   ```
-
-2. Run the install script:
-   ```bash
-   ./install.sh
-   ```
-
-3. Verify installation:
-   ```bash
-   kubectl-monitor --namespace default
-   ```
+```bash
+git clone https://github.com/renancavalcantercb/kubectl-monitor.git && \
+cd kubectl-monitor && \
+chmod +x install.sh && \
+./install.sh && rm -rf kubectl-monitor
+```
 
 ## Usage
 

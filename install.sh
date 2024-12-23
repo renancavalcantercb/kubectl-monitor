@@ -2,7 +2,7 @@
 
 set -e
 
-VERSION="v1.0.3"
+VERSION="v1.0.5"
 
 REPO="renancavalcantercb/kubectl-monitor"
 

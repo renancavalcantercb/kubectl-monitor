@@ -1,9 +1,7 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"strings"
@@ -13,112 +11,133 @@ import (
 )
 
 func main() {
-	namespace := parseArgs(os.Args)
-	output, err := executeKubectl(namespace)
+	namespace := "--all-namespaces"
+
+	if len(os.Args) > 2 && os.Args[1] == "--namespace" {
+		namespace = os.Args[2]
+	}
+
+	getPodsOutput, err := runCommand("kubectl", "get", "pods", "--all-namespaces", "-o", "custom-columns=NAMESPACE:.metadata.namespace,NAME:.metadata.name,STATUS:.status.phase,RESTARTS:.status.containerStatuses[0].restartCount,AGE:.metadata.creationTimestamp")
 	if err != nil {
-		log.Fatalf("Error: %v\n", err)
-	}
-	renderTable(output)
-}
-
-func parseArgs(args []string) string {
-	if len(args) > 1 && args[1] == "--namespace" {
-		if len(args) > 2 {
-			return args[2]
-		}
-		log.Fatalln("Error: Namespace not specified")
-	}
-	return "--all-namespaces"
-}
-
-func executeKubectl(namespace string) (string, error) {
-	args := buildKubectlArgs(namespace)
-	cmd := exec.Command("kubectl", args...)
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("failed to execute kubectl: %w\nOutput: %s", err, out.String())
-	}
-	return out.String(), nil
-}
-
-func buildKubectlArgs(namespace string) []string {
-	args := []string{
-		"get", "pods",
-		"-o", "custom-columns=NAMESPACE:.metadata.namespace,NAME:.metadata.name,CPU:.spec.containers[*].resources.requests.cpu,MEMORY:.spec.containers[*].resources.requests.memory,STATUS:.status.phase,RESTARTS:.status.containerStatuses[*].restartCount,AGE:.metadata.creationTimestamp",
-	}
-	if namespace != "--all-namespaces" {
-		args = append(args, "--namespace", namespace)
-	} else {
-		args = append(args, "--all-namespaces")
-	}
-	return args
-}
-
-func renderTable(output string) {
-	lines := strings.Split(output, "\n")
-	if len(lines) <= 1 {
-		fmt.Println("No data available")
+		fmt.Println("Error fetching pods:", err)
 		return
 	}
 
-	table := tablewriter.NewWriter(os.Stdout)
-	table.SetHeader([]string{"NAMESPACE", "NAME", "CPU", "MEMORY", "STATUS", "RESTARTS", "AGE"})
-	table.SetBorder(true)
+	topPodsOutput, err := runCommand("kubectl", "top", "pods", "--all-namespaces")
+	if err != nil {
+		fmt.Println("Error fetching pod metrics:", err)
+		return
+	}
 
-	for _, line := range lines[1:] {
-		if strings.TrimSpace(line) == "" {
+	renderTable(getPodsOutput, topPodsOutput, namespace)
+}
+
+func runCommand(command string, args ...string) (string, error) {
+	cmd := exec.Command(command, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("error executing command: %v, output: %s", err, string(output))
+	}
+	return string(output), nil
+}
+
+func parseTopPods(lines []string) map[string]map[string][2]string {
+	usage := make(map[string]map[string][2]string)
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" || strings.HasPrefix(line, "NAME") {
 			continue
 		}
 		fields := strings.Fields(line)
-		if len(fields) < 7 {
+		if len(fields) < 4 {
 			continue
 		}
-		namespace, name, cpu, memory, status, restarts := fields[0], fields[1], fields[2], fields[3], fields[4], fields[5]
-		creationTimestamp := strings.Join(fields[6:], " ")
-		age := calculateAge(creationTimestamp)
 
-		coloredStatus := colorStatus(status)
+		namespace := fields[0]
+		name := fields[1]
+		cpu := fields[2]
+		memory := fields[3]
 
-		table.Append([]string{namespace, name, cpu, memory, coloredStatus, restarts, age})
+		if _, exists := usage[namespace]; !exists {
+			usage[namespace] = make(map[string][2]string)
+		}
+		usage[namespace][name] = [2]string{cpu, memory}
+	}
+	return usage
+}
+
+func formatAge(age string) string {
+	parsedTime, err := time.Parse(time.RFC3339, age)
+	if err != nil {
+		return "N/A"
 	}
 
-	table.Render()
+	duration := time.Since(parsedTime)
+	days := int(duration.Hours()) / 24
+	hours := int(duration.Hours()) % 24
+	minutes := int(duration.Minutes()) % 60
+
+	return fmt.Sprintf("%dd %dh %dm", days, hours, minutes)
 }
 
 func colorStatus(status string) string {
 	switch status {
 	case "Running":
-		return "\033[32m" + status + "\033[0m"
+		return "\033[32m" + status + "\033[0m" // Green
 	case "Pending":
-		return "\033[33m" + status + "\033[0m"
+		return "\033[33m" + status + "\033[0m" // Yellow
 	case "Failed":
-		return "\033[31m" + status + "\033[0m"
+		return "\033[31m" + status + "\033[0m" // Red
 	case "Unknown":
-		return "\033[35m" + status + "\033[0m"
+		return "\033[35m" + status + "\033[0m" // Magenta
 	default:
 		return status
 	}
 }
 
-func calculateAge(timestamp string) string {
-	layout := time.RFC3339
-	t, err := time.Parse(layout, timestamp)
-	if err != nil {
-		return "Invalid timestamp"
-	}
-	duration := time.Since(t)
-	days := int(duration.Hours() / 24)
-	hours := int(duration.Hours()) % 24
-	minutes := int(duration.Minutes()) % 60
+func renderTable(getPodsOutput, topPodsOutput, namespace string) {
+	topPodsUsage := parseTopPods(strings.Split(topPodsOutput, "\n"))
+	lines := strings.Split(getPodsOutput, "\n")
 
-	switch {
-	case days > 0:
-		return fmt.Sprintf("%dd %dh %dm", days, hours, minutes)
-	case hours > 0:
-		return fmt.Sprintf("%dh %dm", hours, minutes)
-	default:
-		return fmt.Sprintf("%dm", minutes)
+	table := tablewriter.NewWriter(os.Stdout)
+	if namespace == "--all-namespaces" {
+		table.SetHeader([]string{"NAMESPACE", "NAME", "CPU", "MEMORY", "STATUS", "RESTARTS", "AGE"})
+	} else {
+		table.SetHeader([]string{"NAME", "CPU", "MEMORY", "STATUS", "RESTARTS", "AGE"})
 	}
+
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" || strings.HasPrefix(line, "NAMESPACE") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 5 {
+			continue
+		}
+
+		podNamespace := fields[0]
+		name := fields[1]
+		status := colorStatus(fields[2])
+		restarts := fields[3]
+		ageRaw := strings.Join(fields[4:], " ")
+		age := formatAge(ageRaw)
+
+		cpu := "N/A"
+		memory := "N/A"
+		if nsUsage, exists := topPodsUsage[podNamespace]; exists {
+			if usage, found := nsUsage[name]; found {
+				cpu = usage[0]
+				memory = usage[1]
+			}
+		}
+
+		if namespace == "--all-namespaces" {
+			table.Append([]string{podNamespace, name, cpu, memory, status, restarts, age})
+		} else if namespace == podNamespace {
+			table.Append([]string{name, cpu, memory, status, restarts, age})
+		}
+	}
+
+	table.SetBorder(true)
+	table.SetRowLine(false)
+	table.Render()
 }

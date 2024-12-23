@@ -24,7 +24,7 @@ Run the following command to install Kubectl Monitor:
 git clone https://github.com/renancavalcantercb/kubectl-monitor.git && \
 cd kubectl-monitor && \
 chmod +x install.sh && \
-./install.sh && rm -rf kubectl-monitor
+./install.sh && cd .. && rm -rf kubectl-monitor
 ```
 
 ## Usage

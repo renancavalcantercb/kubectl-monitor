@@ -13,7 +13,6 @@ Kubectl Monitor is a CLI tool designed to enhance the experience of monitoring K
 
 ### Prerequisites
 
-- [Go](https://golang.org/doc/install) installed on your system.
 - `kubectl` configured and working.
 
 ### Installation

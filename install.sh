@@ -7,15 +7,29 @@ ARCH="$(uname -m)"
 
 INSTALL_PATH="/usr/local/bin"
 
-case "$OS" in
-  "darwin")
-    BINARY="kubectl-monitor-darwin-amd64"
+# Normalize architecture name
+case "$ARCH" in
+  "x86_64")
+    ARCH="amd64"
     ;;
-  "linux")
-    BINARY="kubectl-monitor-linux-amd64"
+  "aarch64"|"arm64")
+    ARCH="arm64"
     ;;
   *)
-    echo "Unsupported OS or script not prepared for: $OS"
+    echo "Unsupported architecture: $ARCH"
+    exit 1
+    ;;
+esac
+
+case "$OS" in
+  "darwin")
+    BINARY="kubectl-monitor-darwin-$ARCH"
+    ;;
+  "linux")
+    BINARY="kubectl-monitor-linux-$ARCH"
+    ;;
+  *)
+    echo "Unsupported OS: $OS"
     exit 1
     ;;
 esac

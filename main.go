@@ -43,7 +43,6 @@ const (
 	ColorYellow    = "\033[33m"     // Pending status
 	ColorRed       = "\033[31m"     // Failed status
 	ColorMagenta   = "\033[35m"     // Unknown status
-	ColorBlue      = "\033[34m"     // Info text
 	ColorCyan      = "\033[36m"     // Headers
 	ColorBold      = "\033[1m"      // Emphasis
 	ColorDim       = "\033[2m"      // Secondary text
@@ -658,7 +657,6 @@ func runInteractiveMode(config *Config) error {
 	
 	reader := bufio.NewReader(os.Stdin)
 	currentNamespace := config.Namespace
-	watchMode := config.Watch
 	colorsEnabled := !config.NoColor
 	
 	for {
@@ -667,7 +665,7 @@ func runInteractiveMode(config *Config) error {
 			fmt.Print("\033[2J\033[H")
 		}
 		
-		printInteractiveMenu(config, currentNamespace, watchMode, colorsEnabled)
+		printInteractiveMenu(config, currentNamespace, colorsEnabled)
 		
 		// Get user input
 		fmt.Print("\nChoice: ")
@@ -730,18 +728,17 @@ func runInteractiveMode(config *Config) error {
 }
 
 // printInteractiveMenu displays the interactive menu
-func printInteractiveMenu(config *Config, namespace string, watchMode, colorsEnabled bool) {
+func printInteractiveMenu(config *Config, namespace string, colorsEnabled bool) {
 	title := "kubectl-monitor Interactive Mode"
 	if config.IsColorEnabled() && colorsEnabled {
 		title = ColorBold + ColorCyan + title + ColorReset
 	}
-	
+
 	fmt.Println(title)
 	fmt.Println(strings.Repeat("=", len("kubectl-monitor Interactive Mode")))
 	fmt.Println()
-	
+
 	fmt.Printf("Current Namespace: %s\n", formatNamespaceDisplay(config, namespace, colorsEnabled))
-	fmt.Printf("Watch Mode: %s\n", formatBooleanDisplay(config, watchMode, colorsEnabled))
 	fmt.Printf("Colors: %s\n", formatBooleanDisplay(config, colorsEnabled, colorsEnabled))
 	fmt.Println()
 	
@@ -939,23 +936,6 @@ func formatAge(age string) string {
 	}
 }
 
-// colorStatus applies ANSI color codes to pod status (deprecated - use ColorManager)
-func colorStatus(status string) string {
-	// Maintain backward compatibility
-	switch status {
-	case StatusRunning:
-		return ColorGreen + status + ColorReset
-	case StatusPending:
-		return ColorYellow + status + ColorReset
-	case StatusFailed:
-		return ColorRed + status + ColorReset
-	case StatusUnknown:
-		return ColorMagenta + status + ColorReset
-	default:
-		return status
-	}
-}
-
 // getStatusSymbol returns a symbol for the pod status (accessibility)
 func getStatusSymbol(status string) string {
 	switch status {
@@ -1004,7 +984,7 @@ func renderTable(getPodsOutput, topPodsOutput string, config *Config) error {
 	topPodsUsage := parseTopPods(topPodsOutput)
 	lines := strings.Split(getPodsOutput, "\n")
 
-	table := tablewriter.NewWriter(os.Stdout)
+	table := tablewriter.NewWriter(config.Output)
 
 	var headers []string
 	if config.AllNamespaces {

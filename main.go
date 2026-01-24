@@ -3,12 +3,16 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/csv"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"os/signal"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -26,32 +30,36 @@ const (
 	QuietFlag         = "--quiet"
 	VerboseFlag       = "--verbose"
 	InteractiveFlag   = "--interactive"
+	LabelFlag         = "--label"
+	ProblemsFlag      = "--problems"
+	SortFlag          = "--sort"
+	OutputFormatFlag  = "--format"
 	NotAvailable      = "N/A"
 	MinRequiredFields = 4
 	MinPodFields      = 5
-	AppVersion        = "2.1.0"
+	AppVersion        = "2.2.0"
 	AppName           = "kubectl-monitor"
 
 	// Command timeouts
-	KubectlTimeout    = 30 * time.Second
-	RefreshInterval   = 5 * time.Second
-	ProgressInterval  = 100 * time.Millisecond
+	KubectlTimeout   = 30 * time.Second
+	RefreshInterval  = 5 * time.Second
+	ProgressInterval = 100 * time.Millisecond
 
 	// ANSI color codes - Accessibility friendly
-	ColorReset     = "\033[0m"
-	ColorGreen     = "\033[32m"     // Running status
-	ColorYellow    = "\033[33m"     // Pending status
-	ColorRed       = "\033[31m"     // Failed status
-	ColorMagenta   = "\033[35m"     // Unknown status
-	ColorCyan      = "\033[36m"     // Headers
-	ColorBold      = "\033[1m"      // Emphasis
-	ColorDim       = "\033[2m"      // Secondary text
-	
+	ColorReset   = "\033[0m"
+	ColorGreen   = "\033[32m" // Running status
+	ColorYellow  = "\033[33m" // Pending status
+	ColorRed     = "\033[31m" // Failed status
+	ColorMagenta = "\033[35m" // Unknown status
+	ColorCyan    = "\033[36m" // Headers
+	ColorBold    = "\033[1m"  // Emphasis
+	ColorDim     = "\033[2m"  // Secondary text
+
 	// High contrast colors for accessibility
-	ColorHiGreen   = "\033[92m"     // High contrast green
-	ColorHiYellow  = "\033[93m"     // High contrast yellow
-	ColorHiRed     = "\033[91m"     // High contrast red
-	ColorHiMagenta = "\033[95m"     // High contrast magenta
+	ColorHiGreen   = "\033[92m" // High contrast green
+	ColorHiYellow  = "\033[93m" // High contrast yellow
+	ColorHiRed     = "\033[91m" // High contrast red
+	ColorHiMagenta = "\033[95m" // High contrast magenta
 
 	// kubectl commands
 	KubectlCmd = "kubectl"
@@ -103,6 +111,24 @@ type Config struct {
 	RefreshRate   time.Duration
 	Output        io.Writer
 	ErrorOutput   io.Writer
+	Labels        string // Label selector (e.g., "app=nginx,env=prod")
+	ProblemsOnly  bool   // Show only pods with problems
+	SortBy        string // Sort by: "cpu", "memory", "restarts", "age", "name"
+	OutputFormat  string // Output format: "table", "json", "csv"
+}
+
+// PodData represents parsed pod information for sorting and output
+type PodData struct {
+	Namespace   string    `json:"namespace"`
+	Name        string    `json:"name"`
+	Status      string    `json:"status"`
+	Restarts    int       `json:"restarts"`
+	Age         string    `json:"age"`
+	AgeTime     time.Time `json:"-"`
+	CPU         string    `json:"cpu"`
+	Memory      string    `json:"memory"`
+	CPUMillis   int64     `json:"-"`
+	MemoryBytes int64     `json:"-"`
 }
 
 // Validate validates the configuration
@@ -198,12 +224,12 @@ func (r *DefaultKubectlRunner) RunCommand(command string, args ...string) (strin
 
 // Monitor handles the main monitoring logic
 type Monitor struct {
-	Runner      KubectlRunner
-	Config      *Config
-	ctx         context.Context
-	cancel      context.CancelFunc
-	progress    *ProgressIndicator
-	colorizer   *ColorManager
+	Runner    KubectlRunner
+	Config    *Config
+	ctx       context.Context
+	cancel    context.CancelFunc
+	progress  *ProgressIndicator
+	colorizer *ColorManager
 }
 
 // ProgressIndicator manages progress display
@@ -225,18 +251,18 @@ func NewProgressIndicator(config *Config) *ProgressIndicator {
 func (p *ProgressIndicator) Start(message string) {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
-	
+
 	if p.config.Quiet {
 		return
 	}
-	
+
 	p.active = true
 	p.spinnerIdx = 0
-	
+
 	go func() {
 		for p.active {
 			if p.config.IsColorEnabled() {
-				fmt.Fprintf(p.config.Output, "\r%s%c%s %s", 
+				fmt.Fprintf(p.config.Output, "\r%s%c%s %s",
 					ColorCyan, rune(SpinnerFrames[p.spinnerIdx%len(SpinnerFrames)]), ColorReset, message)
 			} else {
 				fmt.Fprintf(p.config.Output, "\r[%d] %s", p.spinnerIdx%4, message)
@@ -251,24 +277,24 @@ func (p *ProgressIndicator) Start(message string) {
 func (p *ProgressIndicator) Stop(success bool, message string) {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
-	
+
 	if p.config.Quiet {
 		return
 	}
-	
+
 	p.active = false
 	time.Sleep(ProgressInterval) // Let spinner complete
-	
+
 	if success {
 		if p.config.IsColorEnabled() {
-			fmt.Fprintf(p.config.Output, "\r%s%s%s %s\n", 
+			fmt.Fprintf(p.config.Output, "\r%s%s%s %s\n",
 				ColorGreen, CheckMark, ColorReset, message)
 		} else {
 			fmt.Fprintf(p.config.Output, "\r[OK] %s\n", message)
 		}
 	} else {
 		if p.config.IsColorEnabled() {
-			fmt.Fprintf(p.config.Output, "\r%s%s%s %s\n", 
+			fmt.Fprintf(p.config.Output, "\r%s%s%s %s\n",
 				ColorRed, CrossMark, ColorReset, message)
 		} else {
 			fmt.Fprintf(p.config.Output, "\r[FAIL] %s\n", message)
@@ -291,7 +317,7 @@ func (c *ColorManager) GetStatusColor(status string) string {
 	if !c.config.IsColorEnabled() {
 		return ""
 	}
-	
+
 	switch status {
 	case StatusRunning:
 		return ColorHiGreen
@@ -344,7 +370,7 @@ func (m *Monitor) Run() error {
 	// Setup signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	
+
 	go func() {
 		<-sigChan
 		m.Config.LogInfo("Received shutdown signal, cleaning up...")
@@ -354,7 +380,7 @@ func (m *Monitor) Run() error {
 	if m.Config.Watch {
 		return m.runWatchMode()
 	}
-	
+
 	return m.runOnceMode()
 }
 
@@ -368,16 +394,16 @@ func (m *Monitor) runOnceMode() error {
 func (m *Monitor) runWatchMode() error {
 	m.Config.LogInfo("Starting watch mode (refresh every %v)", m.Config.RefreshRate)
 	m.Config.LogInfo("Press Ctrl+C to stop")
-	
+
 	ticker := time.NewTicker(m.Config.RefreshRate)
 	defer ticker.Stop()
-	
+
 	// Run initial execution
 	if err := m.runMonitor(); err != nil {
 		m.Config.LogError("Initial execution failed: %v", err)
 		return err
 	}
-	
+
 	for {
 		select {
 		case <-m.ctx.Done():
@@ -423,7 +449,7 @@ func main() {
 
 	monitor := NewMonitor(config)
 	defer monitor.Close()
-	
+
 	if err := monitor.Run(); err != nil {
 		config.LogError("Monitor execution failed: %v", err)
 		os.Exit(1)
@@ -438,6 +464,7 @@ func parseArguments() (*Config, error) {
 		RefreshRate:   RefreshInterval,
 		Output:        os.Stdout,
 		ErrorOutput:   os.Stderr,
+		OutputFormat:  "table",
 	}
 
 	args := os.Args[1:]
@@ -454,6 +481,36 @@ func parseArguments() (*Config, error) {
 			config.Namespace = namespace
 			config.AllNamespaces = false
 			i++ // Skip the namespace value
+		case LabelFlag:
+			if i+1 >= len(args) {
+				return nil, errors.New("label flag requires a value")
+			}
+			config.Labels = strings.TrimSpace(args[i+1])
+			i++
+		case ProblemsFlag:
+			config.ProblemsOnly = true
+		case SortFlag:
+			if i+1 >= len(args) {
+				return nil, errors.New("sort flag requires a value (cpu, memory, restarts, age, name)")
+			}
+			sortBy := strings.ToLower(strings.TrimSpace(args[i+1]))
+			validSorts := map[string]bool{"cpu": true, "memory": true, "restarts": true, "age": true, "name": true}
+			if !validSorts[sortBy] {
+				return nil, fmt.Errorf("invalid sort value: %s (valid: cpu, memory, restarts, age, name)", sortBy)
+			}
+			config.SortBy = sortBy
+			i++
+		case OutputFormatFlag:
+			if i+1 >= len(args) {
+				return nil, errors.New("format flag requires a value (table, json, csv)")
+			}
+			format := strings.ToLower(strings.TrimSpace(args[i+1]))
+			validFormats := map[string]bool{"table": true, "json": true, "csv": true}
+			if !validFormats[format] {
+				return nil, fmt.Errorf("invalid format value: %s (valid: table, json, csv)", format)
+			}
+			config.OutputFormat = format
+			i++
 		case WatchFlag:
 			config.Watch = true
 		case NoColorFlag:
@@ -498,27 +555,41 @@ USAGE:
 FLAGS:
   Core Options:
 	--namespace <namespace>  Filter pods by namespace
-	--watch                 Watch mode with auto-refresh
-	--interactive          Interactive mode with menu
-	--refresh <duration>   Refresh rate for watch mode (default: %v)
+	--label <selector>       Filter pods by labels (e.g., "app=nginx,env=prod")
+	--watch                  Watch mode with auto-refresh
+	--interactive            Interactive mode with menu
+	--refresh <duration>     Refresh rate for watch mode (default: %v)
 
-  Display Options:
-	--no-color             Disable colored output (accessibility)
-	--quiet                Suppress informational messages
-	--verbose              Show detailed information
+  Filtering & Sorting:
+	--problems               Show only pods with problems (non-Running or restarts > 0)
+	--sort <field>           Sort output by field: cpu, memory, restarts, age, name
+
+  Output Options:
+	--format <format>        Output format: table (default), json, csv
+	--no-color               Disable colored output (accessibility)
+	--quiet                  Suppress informational messages
+	--verbose                Show detailed information
 
   Help:
-	-h, --help             Show this help message
-	-v, --version          Show version information
+	-h, --help               Show this help message
+	-v, --version            Show version information
 
 EXAMPLES:
 	%s                                    # Show all pods across all namespaces
 	%s --namespace default                # Show pods in default namespace
-	%s --watch                           # Watch mode with auto-refresh
-	%s --watch --refresh 10s             # Watch with custom refresh rate
-	%s --interactive                     # Interactive mode with menu
-	%s --no-color                        # Accessible output without colors
-	%s --namespace kube-system --verbose # Verbose output for specific namespace
+	%s --label app=nginx                  # Filter pods by label
+	%s --label "app=nginx,env=prod"       # Filter by multiple labels
+	%s --problems                         # Show only problematic pods
+	%s --sort restarts                    # Sort by restart count
+	%s --sort cpu                         # Sort by CPU usage
+	%s --format json                      # Output in JSON format
+	%s --format csv > pods.csv            # Export to CSV file
+	%s --watch                            # Watch mode with auto-refresh
+	%s --watch --refresh 10s              # Watch with custom refresh rate
+	%s --interactive                      # Interactive mode with menu
+	%s --no-color                         # Accessible output without colors
+	%s --namespace kube-system --verbose  # Verbose output for specific namespace
+	kubectl-monitor --label app=nginx --problems --sort restarts --format json  # Combined
 
 ACCESSIBILITY:
 	This tool supports screen readers and colorblind users:
@@ -535,9 +606,10 @@ KEYBOARD SHORTCUTS (Interactive Mode):
 	n          - Change namespace
 	w          - Toggle watch mode
 	c          - Toggle colors
-`, 
-		AppName, AppName, RefreshInterval, 
-		AppName, AppName, AppName, AppName, AppName, AppName, AppName)
+	l          - View pod logs
+`,
+		AppName, AppName, RefreshInterval,
+		AppName, AppName, AppName, AppName, AppName, AppName, AppName, AppName, AppName, AppName, AppName, AppName, AppName, AppName)
 }
 
 // printVersion prints version information
@@ -548,7 +620,11 @@ func printVersion() {
 	fmt.Println("Features:")
 	fmt.Println("  - Real-time pod monitoring")
 	fmt.Println("  - Watch mode with auto-refresh")
-	fmt.Println("  - Interactive mode with menu navigation")
+	fmt.Println("  - Interactive mode with menu navigation and pod logs")
+	fmt.Println("  - Label selector filtering (--label)")
+	fmt.Println("  - Problem pods filtering (--problems)")
+	fmt.Println("  - Sorting by cpu, memory, restarts, age, name (--sort)")
+	fmt.Println("  - JSON and CSV output formats (--format)")
 	fmt.Println("  - Accessibility support (colorblind, screen readers)")
 	fmt.Println("  - Progress indicators and user feedback")
 	fmt.Println("  - Configurable refresh rates")
@@ -561,26 +637,38 @@ func printVersion() {
 // runMonitor executes the main monitoring logic
 func (m *Monitor) runMonitor() error {
 	m.Config.LogVerbose("Starting kubectl commands execution")
-	
+
 	// Show progress for potentially slow operations
 	m.progress.Start("Fetching pod information...")
-	
+
 	results := make(chan CommandResult, 2)
 	var wg sync.WaitGroup
+
+	// Build kubectl get pods arguments
+	getArgs := []string{GetCmd, PodsCmd, AllNamespacesFlag, "-o", CustomColumns}
+	if m.Config.Labels != "" {
+		getArgs = append(getArgs, "-l", m.Config.Labels)
+	}
+
+	// Build kubectl top pods arguments
+	topArgs := []string{TopCmd, PodsCmd, AllNamespacesFlag}
+	if m.Config.Labels != "" {
+		topArgs = append(topArgs, "-l", m.Config.Labels)
+	}
 
 	// Execute kubectl commands concurrently
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
 		m.Config.LogVerbose("Executing kubectl get pods command")
-		output, err := m.Runner.RunCommand(KubectlCmd, GetCmd, PodsCmd, AllNamespacesFlag, "-o", CustomColumns)
+		output, err := m.Runner.RunCommand(KubectlCmd, getArgs...)
 		results <- CommandResult{Output: output, Error: err, Type: "get"}
 	}()
 
 	go func() {
 		defer wg.Done()
 		m.Config.LogVerbose("Executing kubectl top pods command")
-		output, err := m.Runner.RunCommand(KubectlCmd, TopCmd, PodsCmd, AllNamespacesFlag)
+		output, err := m.Runner.RunCommand(KubectlCmd, topArgs...)
 		results <- CommandResult{Output: output, Error: err, Type: "top"}
 	}()
 
@@ -590,7 +678,7 @@ func (m *Monitor) runMonitor() error {
 	// Collect results
 	var getPodsOutput, topPodsOutput string
 	var getError, topError error
-	
+
 	for result := range results {
 		if result.Type == "get" {
 			getPodsOutput = result.Output
@@ -600,21 +688,21 @@ func (m *Monitor) runMonitor() error {
 			topError = result.Error
 		}
 	}
-	
+
 	// Handle errors gracefully
 	if getError != nil {
 		m.progress.Stop(false, "Failed to fetch pod information")
 		return fmt.Errorf("kubectl get pods failed: %v", getError)
 	}
-	
+
 	if topError != nil {
 		m.Config.LogWarning("kubectl top pods failed (metrics may not be available): %v", topError)
 		m.Config.LogVerbose("Continuing without resource metrics...")
 		topPodsOutput = "" // Continue without metrics
 	}
-	
+
 	m.progress.Stop(true, "Pod information retrieved successfully")
-	
+
 	return renderTable(getPodsOutput, topPodsOutput, m.Config)
 }
 
@@ -631,10 +719,10 @@ func runCommand(command string, args ...string) (string, error) {
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
-			return "", fmt.Errorf("command '%s %s' timed out after %v", 
+			return "", fmt.Errorf("command '%s %s' timed out after %v",
 				command, strings.Join(args, " "), KubectlTimeout)
 		}
-		return "", fmt.Errorf("failed to execute '%s %s': %v\nOutput: %s", 
+		return "", fmt.Errorf("failed to execute '%s %s': %v\nOutput: %s",
 			command, strings.Join(args, " "), err, string(output))
 	}
 	return string(output), nil
@@ -654,28 +742,28 @@ func isTerminal(w io.Writer) bool {
 func runInteractiveMode(config *Config) error {
 	config.LogInfo("Starting interactive mode")
 	config.LogInfo("Use arrow keys to navigate, Enter to select, 'q' to quit")
-	
+
 	reader := bufio.NewReader(os.Stdin)
 	currentNamespace := config.Namespace
 	colorsEnabled := !config.NoColor
-	
+
 	for {
 		// Clear screen and show menu
 		if config.IsColorEnabled() {
 			fmt.Print("\033[2J\033[H")
 		}
-		
+
 		printInteractiveMenu(config, currentNamespace, colorsEnabled)
-		
+
 		// Get user input
 		fmt.Print("\nChoice: ")
 		input, err := reader.ReadString('\n')
 		if err != nil {
 			return fmt.Errorf("failed to read input: %v", err)
 		}
-		
+
 		input = strings.TrimSpace(input)
-		
+
 		switch input {
 		case "1": // Show pods
 			tempConfig := *config
@@ -683,43 +771,46 @@ func runInteractiveMode(config *Config) error {
 			tempConfig.AllNamespaces = (currentNamespace == AllNamespacesFlag)
 			tempConfig.Watch = false
 			tempConfig.NoColor = !colorsEnabled
-			
+
 			monitor := NewMonitor(&tempConfig)
 			if err := monitor.runOnceMode(); err != nil {
 				config.LogError("Failed to show pods: %v", err)
 			}
 			monitor.Close()
-			
+
 			fmt.Print("\nPress Enter to continue...")
 			reader.ReadString('\n')
-			
+
 		case "2": // Start watch mode
 			tempConfig := *config
 			tempConfig.Namespace = currentNamespace
 			tempConfig.AllNamespaces = (currentNamespace == AllNamespacesFlag)
 			tempConfig.Watch = true
 			tempConfig.NoColor = !colorsEnabled
-			
+
 			monitor := NewMonitor(&tempConfig)
 			config.LogInfo("Starting watch mode - Press Ctrl+C to return to menu")
 			monitor.Run() // This will run until interrupted
 			monitor.Close()
-			
+
 		case "3": // Change namespace
 			currentNamespace = promptForNamespace(config, reader)
-			
+
 		case "4": // Toggle colors
 			colorsEnabled = !colorsEnabled
 			config.LogInfo("Colors %s", map[bool]string{true: "enabled", false: "disabled"}[colorsEnabled])
 			time.Sleep(1 * time.Second)
-			
+
 		case "5": // Settings
 			showSettings(config, reader)
-			
+
+		case "6": // View pod logs
+			viewPodLogs(config, reader, currentNamespace)
+
 		case "q", "quit", "exit":
 			config.LogInfo("Goodbye!")
 			return nil
-			
+
 		default:
 			config.LogWarning("Invalid choice: %s", input)
 			time.Sleep(1 * time.Second)
@@ -741,13 +832,14 @@ func printInteractiveMenu(config *Config, namespace string, colorsEnabled bool) 
 	fmt.Printf("Current Namespace: %s\n", formatNamespaceDisplay(config, namespace, colorsEnabled))
 	fmt.Printf("Colors: %s\n", formatBooleanDisplay(config, colorsEnabled, colorsEnabled))
 	fmt.Println()
-	
+
 	fmt.Println("Options:")
 	fmt.Println("  1. Show pods now")
 	fmt.Println("  2. Start watch mode")
 	fmt.Println("  3. Change namespace")
 	fmt.Println("  4. Toggle colors")
 	fmt.Println("  5. Settings")
+	fmt.Println("  6. View pod logs")
 	fmt.Println("  q. Quit")
 }
 
@@ -756,7 +848,7 @@ func formatNamespaceDisplay(config *Config, namespace string, colorsEnabled bool
 	if !config.IsColorEnabled() || !colorsEnabled {
 		return namespace
 	}
-	
+
 	if namespace == AllNamespacesFlag {
 		return ColorYellow + "All Namespaces" + ColorReset
 	}
@@ -769,11 +861,11 @@ func formatBooleanDisplay(config *Config, value, colorsEnabled bool) string {
 	if value {
 		display = "Enabled"
 	}
-	
+
 	if !config.IsColorEnabled() || !colorsEnabled {
 		return display
 	}
-	
+
 	if value {
 		return ColorGreen + display + ColorReset
 	}
@@ -788,15 +880,15 @@ func promptForNamespace(config *Config, reader *bufio.Reader) string {
 	fmt.Println("  3. kube-system")
 	fmt.Println("  4. Enter custom namespace")
 	fmt.Print("\nChoice: ")
-	
+
 	input, err := reader.ReadString('\n')
 	if err != nil {
 		config.LogError("Failed to read input: %v", err)
 		return AllNamespacesFlag
 	}
-	
+
 	input = strings.TrimSpace(input)
-	
+
 	switch input {
 	case "1":
 		return AllNamespacesFlag
@@ -835,15 +927,15 @@ func showSettings(config *Config, reader *bufio.Reader) {
 	fmt.Println("  3. Toggle quiet mode")
 	fmt.Println("  4. Return to main menu")
 	fmt.Print("\nChoice: ")
-	
+
 	input, err := reader.ReadString('\n')
 	if err != nil {
 		config.LogError("Failed to read input: %v", err)
 		return
 	}
-	
+
 	input = strings.TrimSpace(input)
-	
+
 	switch input {
 	case "1":
 		fmt.Print("Enter refresh rate (e.g., 5s, 10s): ")
@@ -870,9 +962,122 @@ func showSettings(config *Config, reader *bufio.Reader) {
 	default:
 		config.LogWarning("Invalid choice")
 	}
-	
+
 	fmt.Print("\nPress Enter to continue...")
 	reader.ReadString('\n')
+}
+
+// viewPodLogs handles the interactive pod logs viewing
+func viewPodLogs(config *Config, reader *bufio.Reader, namespace string) {
+	// Get list of pods
+	pods, err := listPodsForSelection(config, namespace)
+	if err != nil {
+		config.LogError("Failed to list pods: %v", err)
+		fmt.Print("\nPress Enter to continue...")
+		reader.ReadString('\n')
+		return
+	}
+
+	if len(pods) == 0 {
+		config.LogWarning("No pods found")
+		fmt.Print("\nPress Enter to continue...")
+		reader.ReadString('\n')
+		return
+	}
+
+	// Display pod selection menu
+	fmt.Println("\nSelect a pod to view logs:")
+	fmt.Println(strings.Repeat("-", 60))
+	for i, pod := range pods {
+		if namespace == AllNamespacesFlag {
+			fmt.Printf("  %d. %s/%s (%s)\n", i+1, pod.Namespace, pod.Name, pod.Status)
+		} else {
+			fmt.Printf("  %d. %s (%s)\n", i+1, pod.Name, pod.Status)
+		}
+	}
+	fmt.Println("  0. Cancel")
+	fmt.Print("\nChoice: ")
+
+	input, err := reader.ReadString('\n')
+	if err != nil {
+		config.LogError("Failed to read input: %v", err)
+		return
+	}
+
+	input = strings.TrimSpace(input)
+	if input == "0" || input == "" {
+		return
+	}
+
+	choice, err := strconv.Atoi(input)
+	if err != nil || choice < 1 || choice > len(pods) {
+		config.LogWarning("Invalid selection")
+		fmt.Print("\nPress Enter to continue...")
+		reader.ReadString('\n')
+		return
+	}
+
+	selectedPod := pods[choice-1]
+
+	// Ask for number of lines
+	fmt.Print("Number of log lines to show (default: 50): ")
+	linesInput, _ := reader.ReadString('\n')
+	linesInput = strings.TrimSpace(linesInput)
+	lines := 50
+	if linesInput != "" {
+		if parsed, err := strconv.Atoi(linesInput); err == nil && parsed > 0 {
+			lines = parsed
+		}
+	}
+
+	// Show logs
+	err = showPodLogs(config, selectedPod.Namespace, selectedPod.Name, lines)
+	if err != nil {
+		config.LogError("Failed to get logs: %v", err)
+	}
+
+	fmt.Print("\nPress Enter to continue...")
+	reader.ReadString('\n')
+}
+
+// listPodsForSelection returns a list of pods for the interactive selection
+func listPodsForSelection(config *Config, namespace string) ([]PodData, error) {
+	var args []string
+	if namespace == AllNamespacesFlag {
+		args = []string{GetCmd, PodsCmd, AllNamespacesFlag, "-o", CustomColumns}
+	} else {
+		args = []string{GetCmd, PodsCmd, "-n", namespace, "-o", CustomColumns}
+	}
+
+	output, err := runCommand(KubectlCmd, args...)
+	if err != nil {
+		return nil, err
+	}
+
+	tempConfig := &Config{
+		AllNamespaces: namespace == AllNamespacesFlag,
+		Namespace:     namespace,
+	}
+
+	return parsePods(output, "", tempConfig)
+}
+
+// showPodLogs displays logs for a specific pod
+func showPodLogs(config *Config, namespace, podName string, lines int) error {
+	args := []string{"logs", "-n", namespace, podName, "--tail", strconv.Itoa(lines)}
+
+	config.LogInfo("Fetching logs for %s/%s (last %d lines)...", namespace, podName, lines)
+	fmt.Println(strings.Repeat("-", 60))
+
+	output, err := runCommand(KubectlCmd, args...)
+	if err != nil {
+		return err
+	}
+
+	fmt.Println(output)
+	fmt.Println(strings.Repeat("-", 60))
+
+	return nil
 }
 
 // parseTopPods parses kubectl top pods output into a usage map
@@ -883,13 +1088,13 @@ func parseTopPods(output string) map[string]map[string]PodUsage {
 
 	lines := strings.Split(output, "\n")
 	usage := make(map[string]map[string]PodUsage, len(lines))
-	
+
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "NAME") {
 			continue
 		}
-		
+
 		fields := strings.Fields(line)
 		if len(fields) < MinRequiredFields {
 			continue
@@ -955,11 +1160,11 @@ func getStatusSymbol(status string) string {
 // formatStatusWithAccessibility formats status with both color and symbols
 func formatStatusWithAccessibility(status string, colorEnabled bool) string {
 	symbol := getStatusSymbol(status)
-	
+
 	if !colorEnabled {
 		return fmt.Sprintf("%s %s", symbol, status)
 	}
-	
+
 	// Use high contrast colors for better accessibility
 	switch status {
 	case StatusRunning:
@@ -975,15 +1180,239 @@ func formatStatusWithAccessibility(status string, colorEnabled bool) string {
 	}
 }
 
-// renderTable renders pod information in a formatted table
-func renderTable(getPodsOutput, topPodsOutput string, config *Config) error {
+// parsePods parses kubectl output into PodData slice
+func parsePods(getPodsOutput, topPodsOutput string, config *Config) ([]PodData, error) {
 	if getPodsOutput == "" {
-		return errors.New("pod output is empty")
+		return nil, errors.New("pod output is empty")
 	}
 
 	topPodsUsage := parseTopPods(topPodsOutput)
 	lines := strings.Split(getPodsOutput, "\n")
+	pods := make([]PodData, 0, len(lines))
 
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "NAMESPACE") {
+			continue
+		}
+
+		fields := strings.Fields(line)
+		if len(fields) < MinPodFields {
+			continue
+		}
+
+		podNamespace := fields[0]
+		name := fields[1]
+		status := fields[2]
+		restartsStr := fields[3]
+		ageRaw := strings.Join(fields[4:], " ")
+
+		// Filter by namespace if not using all namespaces
+		if !config.AllNamespaces && config.Namespace != podNamespace {
+			continue
+		}
+
+		restarts, _ := strconv.Atoi(restartsStr)
+		ageTime, _ := time.Parse(time.RFC3339, ageRaw)
+
+		cpu := NotAvailable
+		memory := NotAvailable
+		var cpuMillis int64
+		var memoryBytes int64
+
+		if nsUsage, exists := topPodsUsage[podNamespace]; exists {
+			if usage, found := nsUsage[name]; found {
+				cpu = usage.CPU
+				memory = usage.Memory
+				cpuMillis = parseCPU(cpu)
+				memoryBytes = parseMemory(memory)
+			}
+		}
+
+		pod := PodData{
+			Namespace:   podNamespace,
+			Name:        name,
+			Status:      status,
+			Restarts:    restarts,
+			Age:         formatAge(ageRaw),
+			AgeTime:     ageTime,
+			CPU:         cpu,
+			Memory:      memory,
+			CPUMillis:   cpuMillis,
+			MemoryBytes: memoryBytes,
+		}
+
+		// Filter by problems if --problems flag is set
+		if config.ProblemsOnly {
+			if status == StatusRunning && restarts == 0 {
+				continue // Skip healthy pods
+			}
+		}
+
+		pods = append(pods, pod)
+	}
+
+	return pods, nil
+}
+
+// parseCPU parses CPU string (e.g., "100m", "1") to millicores
+func parseCPU(cpu string) int64 {
+	if cpu == NotAvailable || cpu == "" {
+		return 0
+	}
+	cpu = strings.TrimSpace(cpu)
+	if strings.HasSuffix(cpu, "m") {
+		val, _ := strconv.ParseInt(strings.TrimSuffix(cpu, "m"), 10, 64)
+		return val
+	}
+	// If no suffix, it's in cores
+	val, _ := strconv.ParseFloat(cpu, 64)
+	return int64(val * 1000)
+}
+
+// parseMemory parses memory string (e.g., "128Mi", "1Gi") to bytes
+func parseMemory(memory string) int64 {
+	if memory == NotAvailable || memory == "" {
+		return 0
+	}
+	memory = strings.TrimSpace(memory)
+
+	multipliers := map[string]int64{
+		"Ki": 1024,
+		"Mi": 1024 * 1024,
+		"Gi": 1024 * 1024 * 1024,
+		"Ti": 1024 * 1024 * 1024 * 1024,
+		"K":  1000,
+		"M":  1000 * 1000,
+		"G":  1000 * 1000 * 1000,
+		"T":  1000 * 1000 * 1000 * 1000,
+	}
+
+	for suffix, mult := range multipliers {
+		if strings.HasSuffix(memory, suffix) {
+			val, _ := strconv.ParseInt(strings.TrimSuffix(memory, suffix), 10, 64)
+			return val * mult
+		}
+	}
+
+	val, _ := strconv.ParseInt(memory, 10, 64)
+	return val
+}
+
+// sortPods sorts pods by the specified field
+func sortPods(pods []PodData, sortBy string) {
+	if sortBy == "" {
+		return
+	}
+
+	sort.Slice(pods, func(i, j int) bool {
+		switch sortBy {
+		case "cpu":
+			return pods[i].CPUMillis > pods[j].CPUMillis // Descending
+		case "memory":
+			return pods[i].MemoryBytes > pods[j].MemoryBytes // Descending
+		case "restarts":
+			return pods[i].Restarts > pods[j].Restarts // Descending
+		case "age":
+			return pods[i].AgeTime.Before(pods[j].AgeTime) // Oldest first
+		case "name":
+			return pods[i].Name < pods[j].Name // Alphabetical
+		default:
+			return false
+		}
+	})
+}
+
+// renderJSON outputs pods in JSON format
+func renderJSON(pods []PodData, config *Config) error {
+	encoder := json.NewEncoder(config.Output)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(pods)
+}
+
+// renderCSV outputs pods in CSV format
+func renderCSV(pods []PodData, config *Config) error {
+	writer := csv.NewWriter(config.Output)
+	defer writer.Flush()
+
+	// Write header
+	var headers []string
+	if config.AllNamespaces {
+		headers = []string{"NAMESPACE", "NAME", "CPU", "MEMORY", "STATUS", "RESTARTS", "AGE"}
+	} else {
+		headers = []string{"NAME", "CPU", "MEMORY", "STATUS", "RESTARTS", "AGE"}
+	}
+	if err := writer.Write(headers); err != nil {
+		return err
+	}
+
+	// Write data rows
+	for _, pod := range pods {
+		var row []string
+		if config.AllNamespaces {
+			row = []string{
+				pod.Namespace,
+				pod.Name,
+				pod.CPU,
+				pod.Memory,
+				pod.Status,
+				strconv.Itoa(pod.Restarts),
+				pod.Age,
+			}
+		} else {
+			row = []string{
+				pod.Name,
+				pod.CPU,
+				pod.Memory,
+				pod.Status,
+				strconv.Itoa(pod.Restarts),
+				pod.Age,
+			}
+		}
+		if err := writer.Write(row); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// renderTable renders pod information in a formatted table
+func renderTable(getPodsOutput, topPodsOutput string, config *Config) error {
+	// Parse pods into PodData slice
+	pods, err := parsePods(getPodsOutput, topPodsOutput, config)
+	if err != nil {
+		return err
+	}
+
+	// Sort pods if --sort flag is set
+	sortPods(pods, config.SortBy)
+
+	// Check for empty results
+	if len(pods) == 0 {
+		if config.ProblemsOnly {
+			fmt.Fprintln(config.Output, "No problematic pods found")
+		} else if config.AllNamespaces {
+			fmt.Fprintln(config.Output, "No pods found in any namespace")
+		} else {
+			fmt.Fprintf(config.Output, "No pods found in namespace '%s'\n", config.Namespace)
+		}
+		return nil
+	}
+
+	// Render based on output format
+	switch config.OutputFormat {
+	case "json":
+		return renderJSON(pods, config)
+	case "csv":
+		return renderCSV(pods, config)
+	default:
+		return renderTableFormat(pods, config)
+	}
+}
+
+// renderTableFormat renders pods in table format
+func renderTableFormat(pods []PodData, config *Config) error {
 	table := tablewriter.NewWriter(config.Output)
 
 	var headers []string
@@ -992,54 +1421,33 @@ func renderTable(getPodsOutput, topPodsOutput string, config *Config) error {
 	} else {
 		headers = []string{"NAME", "CPU", "MEMORY", "STATUS", "RESTARTS", "AGE"}
 	}
-	
+
 	table.SetHeader(headers)
 	setupTableFormat(table, len(headers), config)
 
-	rowCount := 0
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "NAMESPACE") {
-			continue
-		}
-		
-		fields := strings.Fields(line)
-		if len(fields) < MinPodFields {
-			continue
-		}
-
-		podNamespace := fields[0]
-		name := fields[1]
-		status := formatStatusWithAccessibility(fields[2], config.IsColorEnabled())
-		restarts := fields[3]
-		ageRaw := strings.Join(fields[4:], " ")
-		age := formatAge(ageRaw)
-
-		cpu := NotAvailable
-		memory := NotAvailable
-		if nsUsage, exists := topPodsUsage[podNamespace]; exists {
-			if usage, found := nsUsage[name]; found {
-				cpu = usage.CPU
-				memory = usage.Memory
-			}
-		}
+	for _, pod := range pods {
+		status := formatStatusWithAccessibility(pod.Status, config.IsColorEnabled())
 
 		if config.AllNamespaces {
-			table.Append([]string{podNamespace, name, cpu, memory, status, restarts, age})
-			rowCount++
-		} else if config.Namespace == podNamespace {
-			table.Append([]string{name, cpu, memory, status, restarts, age})
-			rowCount++
-		}
-	}
-
-	if rowCount == 0 {
-		if config.AllNamespaces {
-			fmt.Println("No pods found in any namespace")
+			table.Append([]string{
+				pod.Namespace,
+				pod.Name,
+				pod.CPU,
+				pod.Memory,
+				status,
+				strconv.Itoa(pod.Restarts),
+				pod.Age,
+			})
 		} else {
-			fmt.Printf("No pods found in namespace '%s'\n", config.Namespace)
+			table.Append([]string{
+				pod.Name,
+				pod.CPU,
+				pod.Memory,
+				status,
+				strconv.Itoa(pod.Restarts),
+				pod.Age,
+			})
 		}
-		return nil
 	}
 
 	table.Render()
@@ -1058,7 +1466,7 @@ func setupTableFormat(table *tablewriter.Table, headerCount int, config *Config)
 	table.SetHeaderAlignment(tablewriter.ALIGN_LEFT)
 	table.SetAutoWrapText(false)
 	table.SetAutoFormatHeaders(true)
-	
+
 	// Only apply colors if enabled (accessibility)
 	if config.IsColorEnabled() {
 		// Create header colors based on the number of headers
@@ -1068,7 +1476,7 @@ func setupTableFormat(table *tablewriter.Table, headerCount int, config *Config)
 		}
 		table.SetHeaderColor(headerColors...)
 	}
-	
+
 	// Set table caption for screen readers
 	if config.AllNamespaces {
 		table.SetCaption(true, "Kubernetes pods across all namespaces with resource usage")

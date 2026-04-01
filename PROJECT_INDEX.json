@@ -1,0 +1,98 @@
+{
+  "project": {
+    "name": "kubectl-monitor",
+    "version": "2.2.0",
+    "language": "Go",
+    "go_version": "1.23.2",
+    "module": "github.com/renancavalcantercb/kubectl-monitor",
+    "license": "MIT",
+    "generated": "2026-04-01"
+  },
+  "entry_points": [
+    { "path": "main.go", "line": 434, "symbol": "main", "description": "CLI entry point" },
+    { "path": "main.go", "line": 460, "symbol": "parseArguments", "description": "Parse and validate all CLI flags → *Config" },
+    { "path": "main.go", "line": 345, "symbol": "NewMonitor", "description": "Create Monitor with context and signal handling" }
+  ],
+  "files": {
+    "source": ["main.go"],
+    "config": ["go.mod", "go.sum"],
+    "scripts": ["build.sh", "install.sh"],
+    "docs": ["README.md", "DOCS.md", "PROJECT_INDEX.md"],
+    "binaries": [
+      "bin/kubectl-monitor-darwin-amd64",
+      "bin/kubectl-monitor-darwin-arm64",
+      "bin/kubectl-monitor-linux-amd64",
+      "bin/kubectl-monitor-linux-arm64"
+    ]
+  },
+  "types": [
+    { "name": "Config", "line": 103, "purpose": "All runtime settings" },
+    { "name": "PodData", "line": 121, "purpose": "Single pod info with parsed CPU/memory values" },
+    { "name": "PodUsage", "line": 90, "purpose": "CPU+memory strings from kubectl top" },
+    { "name": "CommandResult", "line": 96, "purpose": "Output+error from a kubectl invocation" },
+    { "name": "Monitor", "line": 226, "purpose": "Orchestrates monitoring logic" },
+    { "name": "KubectlRunner", "line": 213, "purpose": "Interface for kubectl execution (testable)" },
+    { "name": "DefaultKubectlRunner", "line": 218, "purpose": "Real kubectl implementation with 30s timeout" },
+    { "name": "ProgressIndicator", "line": 236, "purpose": "Thread-safe animated spinner" },
+    { "name": "ColorManager", "line": 306, "purpose": "ANSI color selection by pod status" }
+  ],
+  "functions": {
+    "execution": [
+      { "name": "main", "line": 434 },
+      { "name": "runInteractiveMode", "line": 742 },
+      { "name": "runCommand", "line": 710 }
+    ],
+    "data_processing": [
+      { "name": "parsePods", "line": 1184, "description": "Merges get+top output → []PodData" },
+      { "name": "parseTopPods", "line": 1084, "description": "Extracts CPU/memory map from top output" },
+      { "name": "sortPods", "line": 1303, "description": "In-place sort by cpu/memory/restarts/age/name" },
+      { "name": "parseCPU", "line": 1259, "description": "\"100m\" → int64 millicores" },
+      { "name": "parseMemory", "line": 1274, "description": "\"128Mi\"/\"1Gi\" → int64 bytes" },
+      { "name": "formatAge", "line": 1120, "description": "RFC3339 → \"5d 2h 10m\"" }
+    ],
+    "rendering": [
+      { "name": "renderTable", "line": 1381 },
+      { "name": "renderTableFormat", "line": 1415 },
+      { "name": "renderJSON", "line": 1327 },
+      { "name": "renderCSV", "line": 1334 },
+      { "name": "formatStatusWithAccessibility", "line": 1161 },
+      { "name": "setupTableFormat", "line": 1458 }
+    ],
+    "interactive": [
+      { "name": "printInteractiveMenu", "line": 822 },
+      { "name": "promptForNamespace", "line": 876 },
+      { "name": "showSettings", "line": 919 },
+      { "name": "viewPodLogs", "line": 971 },
+      { "name": "listPodsForSelection", "line": 1044 },
+      { "name": "showPodLogs", "line": 1066 }
+    ]
+  },
+  "cli_flags": [
+    { "flag": "--namespace", "type": "string", "default": "", "description": "Filter by namespace (empty = all)" },
+    { "flag": "--label", "type": "string", "default": "", "description": "Label selector e.g. app=nginx,env=prod" },
+    { "flag": "--watch", "type": "bool", "default": false, "description": "Auto-refresh mode" },
+    { "flag": "--refresh", "type": "duration", "default": "5s", "description": "Refresh interval for watch mode" },
+    { "flag": "--interactive", "type": "bool", "default": false, "description": "Interactive menu mode" },
+    { "flag": "--problems", "type": "bool", "default": false, "description": "Show only non-Running or restarted pods" },
+    { "flag": "--sort", "type": "string", "default": "", "values": ["cpu", "memory", "restarts", "age", "name"] },
+    { "flag": "--format", "type": "string", "default": "table", "values": ["table", "json", "csv"] },
+    { "flag": "--no-color", "type": "bool", "default": false, "description": "Disable ANSI colors" },
+    { "flag": "--quiet", "type": "bool", "default": false, "description": "Suppress informational messages" },
+    { "flag": "--verbose", "type": "bool", "default": false, "description": "Show detailed information" }
+  ],
+  "dependencies": [
+    { "package": "github.com/olekukonko/tablewriter", "version": "v0.0.5", "purpose": "ASCII table rendering", "direct": true },
+    { "package": "github.com/mattn/go-runewidth", "version": "v0.0.15", "purpose": "Unicode char width", "direct": false },
+    { "package": "github.com/rivo/uniseg", "version": "v0.4.7", "purpose": "Unicode segmentation", "direct": false }
+  ],
+  "concurrency": {
+    "pattern": "goroutines + buffered channel",
+    "description": "kubectl get and kubectl top run concurrently, results collected via chan CommandResult",
+    "timeout_per_command": "30s",
+    "watch_mechanism": "time.NewTicker + context.Done",
+    "shutdown": "SIGINT/SIGTERM → context cancel → clean exit"
+  },
+  "platforms": ["darwin/amd64", "darwin/arm64", "linux/amd64", "linux/arm64"],
+  "install_path": "/usr/local/bin/kubectl-monitor",
+  "runtime_dependency": "kubectl (must be configured)"
+}

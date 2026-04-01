@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/olekukonko/tablewriter"
+	"gopkg.in/yaml.v3"
 )
 
 // Constants for magic strings and values
@@ -34,6 +36,7 @@ const (
 	ProblemsFlag      = "--problems"
 	SortFlag          = "--sort"
 	OutputFormatFlag  = "--format"
+	SinceFlag         = "--since"
 	NotAvailable      = "N/A"
 	MinRequiredFields = 4
 	MinPodFields      = 5
@@ -99,6 +102,38 @@ type CommandResult struct {
 	Type   string // "get" or "top"
 }
 
+// PodChange represents a change detected in a pod between watch refreshes
+type PodChange struct {
+	Pod           PodData
+	OldStatus     string // non-empty when status changed
+	RestartsAdded int    // delta in restart count
+}
+
+// PodDiff represents changes between two watch refreshes
+type PodDiff struct {
+	Added   []PodData
+	Removed []string // "namespace/name" keys
+	Changed []PodChange
+}
+
+// HasChanges returns true if there are any changes in the diff
+func (d *PodDiff) HasChanges() bool {
+	return len(d.Added) > 0 || len(d.Removed) > 0 || len(d.Changed) > 0
+}
+
+// FileConfig represents the structure of ~/.kubectl-monitor.yaml
+type FileConfig struct {
+	Namespace string `yaml:"namespace"`
+	Sort      string `yaml:"sort"`
+	Format    string `yaml:"format"`
+	Refresh   string `yaml:"refresh"`
+	NoColor   bool   `yaml:"no_color"`
+	Quiet     bool   `yaml:"quiet"`
+	Verbose   bool   `yaml:"verbose"`
+	Labels    string `yaml:"label"`
+	Since     string `yaml:"since"`
+}
+
 // Config holds application configuration
 type Config struct {
 	Namespace     string
@@ -111,10 +146,11 @@ type Config struct {
 	RefreshRate   time.Duration
 	Output        io.Writer
 	ErrorOutput   io.Writer
-	Labels        string // Label selector (e.g., "app=nginx,env=prod")
-	ProblemsOnly  bool   // Show only pods with problems
-	SortBy        string // Sort by: "cpu", "memory", "restarts", "age", "name"
-	OutputFormat  string // Output format: "table", "json", "csv"
+	Labels        string        // Label selector (e.g., "app=nginx,env=prod")
+	ProblemsOnly  bool          // Show only pods with problems
+	SortBy        string        // Sort by: "cpu", "memory", "restarts", "age", "name"
+	OutputFormat  string        // Output format: "table", "json", "csv"
+	Since         time.Duration // Show only pods created within this duration (0 = disabled)
 }
 
 // PodData represents parsed pod information for sorting and output
@@ -224,12 +260,13 @@ func (r *DefaultKubectlRunner) RunCommand(command string, args ...string) (strin
 
 // Monitor handles the main monitoring logic
 type Monitor struct {
-	Runner    KubectlRunner
-	Config    *Config
-	ctx       context.Context
-	cancel    context.CancelFunc
-	progress  *ProgressIndicator
-	colorizer *ColorManager
+	Runner       KubectlRunner
+	Config       *Config
+	ctx          context.Context
+	cancel       context.CancelFunc
+	progress     *ProgressIndicator
+	colorizer    *ColorManager
+	previousPods map[string]PodData // previous state for diff in watch mode
 }
 
 // ProgressIndicator manages progress display
@@ -467,6 +504,15 @@ func parseArguments() (*Config, error) {
 		OutputFormat:  "table",
 	}
 
+	// Load config file first (CLI args override file values)
+	if fc, err := loadConfigFile(); err != nil {
+		return nil, err
+	} else if fc != nil {
+		if err := applyFileConfig(config, fc); err != nil {
+			return nil, err
+		}
+	}
+
 	args := os.Args[1:]
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -531,6 +577,16 @@ func parseArguments() (*Config, error) {
 			}
 			config.RefreshRate = refresh
 			i++ // Skip the refresh value
+		case SinceFlag:
+			if i+1 >= len(args) {
+				return nil, errors.New("since flag requires a value (e.g., 10m, 2h)")
+			}
+			since, err := time.ParseDuration(args[i+1])
+			if err != nil {
+				return nil, fmt.Errorf("invalid since duration: %v", err)
+			}
+			config.Since = since
+			i++
 		case "-h", "--help":
 			printUsage()
 			os.Exit(0)
@@ -563,6 +619,7 @@ FLAGS:
   Filtering & Sorting:
 	--problems               Show only pods with problems (non-Running or restarts > 0)
 	--sort <field>           Sort output by field: cpu, memory, restarts, age, name
+	--since <duration>       Show only pods created within duration (e.g. 10m, 2h, 1d)
 
   Output Options:
 	--format <format>        Output format: table (default), json, csv
@@ -589,7 +646,19 @@ EXAMPLES:
 	%s --interactive                      # Interactive mode with menu
 	%s --no-color                         # Accessible output without colors
 	%s --namespace kube-system --verbose  # Verbose output for specific namespace
+	%s --since 10m                        # Pods created in the last 10 minutes
+	%s --since 2h --problems              # Recent problematic pods
 	kubectl-monitor --label app=nginx --problems --sort restarts --format json  # Combined
+
+CONFIG FILE:
+	Defaults can be set in ~/.kubectl-monitor.yaml:
+	  namespace: production
+	  sort: restarts
+	  format: table
+	  refresh: 10s
+	  no_color: false
+	  since: 2h
+	CLI flags always override config file values.
 
 ACCESSIBILITY:
 	This tool supports screen readers and colorblind users:
@@ -609,7 +678,7 @@ KEYBOARD SHORTCUTS (Interactive Mode):
 	l          - View pod logs
 `,
 		AppName, AppName, RefreshInterval,
-		AppName, AppName, AppName, AppName, AppName, AppName, AppName, AppName, AppName, AppName, AppName, AppName, AppName, AppName)
+		AppName, AppName, AppName, AppName, AppName, AppName, AppName, AppName, AppName, AppName, AppName, AppName, AppName, AppName, AppName, AppName)
 }
 
 // printVersion prints version information
@@ -623,15 +692,192 @@ func printVersion() {
 	fmt.Println("  - Interactive mode with menu navigation and pod logs")
 	fmt.Println("  - Label selector filtering (--label)")
 	fmt.Println("  - Problem pods filtering (--problems)")
+	fmt.Println("  - Recent pods filter (--since)")
 	fmt.Println("  - Sorting by cpu, memory, restarts, age, name (--sort)")
 	fmt.Println("  - JSON and CSV output formats (--format)")
 	fmt.Println("  - Accessibility support (colorblind, screen readers)")
 	fmt.Println("  - Progress indicators and user feedback")
 	fmt.Println("  - Configurable refresh rates")
+	fmt.Println("  - Config file support (~/.kubectl-monitor.yaml)")
+	fmt.Println("  - Watch mode diff (highlights changes between refreshes)")
 	fmt.Println("  - Comprehensive error handling")
 	fmt.Println("")
 	fmt.Println("Copyright (c) 2024 - Licensed under MIT")
 	fmt.Println("Report issues: https://github.com/renancavalcantercb/kubectl-monitor/issues")
+}
+
+// loadConfigFile reads ~/.kubectl-monitor.yaml and returns parsed config, or nil if not found
+func loadConfigFile() (*FileConfig, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, nil // no home dir, skip silently
+	}
+	path := filepath.Join(home, ".kubectl-monitor.yaml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil // file doesn't exist, that's fine
+		}
+		return nil, fmt.Errorf("failed to read config file: %w", err)
+	}
+	var fc FileConfig
+	if err := yaml.Unmarshal(data, &fc); err != nil {
+		return nil, fmt.Errorf("invalid config file (~/.kubectl-monitor.yaml): %w", err)
+	}
+	return &fc, nil
+}
+
+// applyFileConfig applies file-based config values as defaults (CLI args override these)
+func applyFileConfig(config *Config, fc *FileConfig) error {
+	if fc.Namespace != "" {
+		config.Namespace = fc.Namespace
+		config.AllNamespaces = false
+	}
+	if fc.Sort != "" {
+		validSorts := map[string]bool{"cpu": true, "memory": true, "restarts": true, "age": true, "name": true}
+		if !validSorts[strings.ToLower(fc.Sort)] {
+			return fmt.Errorf("config file: invalid sort value: %s (valid: cpu, memory, restarts, age, name)", fc.Sort)
+		}
+		config.SortBy = strings.ToLower(fc.Sort)
+	}
+	if fc.Format != "" {
+		validFormats := map[string]bool{"table": true, "json": true, "csv": true}
+		if !validFormats[strings.ToLower(fc.Format)] {
+			return fmt.Errorf("config file: invalid format value: %s (valid: table, json, csv)", fc.Format)
+		}
+		config.OutputFormat = strings.ToLower(fc.Format)
+	}
+	if fc.Refresh != "" {
+		d, err := time.ParseDuration(fc.Refresh)
+		if err != nil {
+			return fmt.Errorf("config file: invalid refresh duration: %v", err)
+		}
+		config.RefreshRate = d
+	}
+	if fc.Since != "" {
+		d, err := time.ParseDuration(fc.Since)
+		if err != nil {
+			return fmt.Errorf("config file: invalid since duration: %v", err)
+		}
+		config.Since = d
+	}
+	if fc.NoColor {
+		config.NoColor = true
+	}
+	if fc.Quiet {
+		config.Quiet = true
+	}
+	if fc.Verbose {
+		config.Verbose = true
+	}
+	if fc.Labels != "" {
+		config.Labels = fc.Labels
+	}
+	return nil
+}
+
+// podsToMap converts a slice of PodData to a map keyed by "namespace/name"
+func podsToMap(pods []PodData) map[string]PodData {
+	m := make(map[string]PodData, len(pods))
+	for _, p := range pods {
+		m[p.Namespace+"/"+p.Name] = p
+	}
+	return m
+}
+
+// diffPods computes what changed between two pod maps
+func diffPods(previous, current map[string]PodData) PodDiff {
+	var diff PodDiff
+
+	for key, cur := range current {
+		prev, existed := previous[key]
+		if !existed {
+			diff.Added = append(diff.Added, cur)
+			continue
+		}
+		change := PodChange{Pod: cur}
+		changed := false
+		if cur.Status != prev.Status {
+			change.OldStatus = prev.Status
+			changed = true
+		}
+		if cur.Restarts > prev.Restarts {
+			change.RestartsAdded = cur.Restarts - prev.Restarts
+			changed = true
+		}
+		if changed {
+			diff.Changed = append(diff.Changed, change)
+		}
+	}
+
+	for key := range previous {
+		if _, exists := current[key]; !exists {
+			diff.Removed = append(diff.Removed, key)
+		}
+	}
+
+	return diff
+}
+
+// printDiff prints a summary of pod changes since the last watch refresh
+func (m *Monitor) printDiff(diff PodDiff) {
+	colorEnabled := m.Config.IsColorEnabled()
+	sep := strings.Repeat("─", 52)
+
+	if colorEnabled {
+		fmt.Fprintf(m.Config.Output, "%s── Changes since last refresh ─────────────────────%s\n", ColorBold, ColorReset)
+	} else {
+		fmt.Fprintln(m.Config.Output, "-- Changes since last refresh --")
+	}
+
+	for _, pod := range diff.Added {
+		name := pod.Namespace + "/" + pod.Name
+		if !m.Config.AllNamespaces {
+			name = pod.Name
+		}
+		label := fmt.Sprintf("  + %s (new)", name)
+		if colorEnabled {
+			fmt.Fprintf(m.Config.Output, "%s%s%s\n", ColorHiGreen, label, ColorReset)
+		} else {
+			fmt.Fprintln(m.Config.Output, label)
+		}
+	}
+
+	for _, key := range diff.Removed {
+		parts := strings.SplitN(key, "/", 2)
+		name := key
+		if len(parts) == 2 && !m.Config.AllNamespaces {
+			name = parts[1]
+		}
+		label := fmt.Sprintf("  - %s (removed)", name)
+		if colorEnabled {
+			fmt.Fprintf(m.Config.Output, "%s%s%s\n", ColorHiRed, label, ColorReset)
+		} else {
+			fmt.Fprintln(m.Config.Output, label)
+		}
+	}
+
+	for _, c := range diff.Changed {
+		name := c.Pod.Namespace + "/" + c.Pod.Name
+		if !m.Config.AllNamespaces {
+			name = c.Pod.Name
+		}
+		var parts []string
+		if c.OldStatus != "" {
+			parts = append(parts, fmt.Sprintf("%s→%s", c.OldStatus, c.Pod.Status))
+		}
+		if c.RestartsAdded > 0 {
+			parts = append(parts, fmt.Sprintf("restarts +%d (total: %d)", c.RestartsAdded, c.Pod.Restarts))
+		}
+		label := fmt.Sprintf("  ~ %s  %s", name, strings.Join(parts, ", "))
+		if colorEnabled {
+			fmt.Fprintf(m.Config.Output, "%s%s%s\n", ColorHiYellow, label, ColorReset)
+		} else {
+			fmt.Fprintln(m.Config.Output, label)
+		}
+	}
+
+	fmt.Fprintln(m.Config.Output, sep)
 }
 
 // runMonitor executes the main monitoring logic
@@ -702,6 +948,21 @@ func (m *Monitor) runMonitor() error {
 	}
 
 	m.progress.Stop(true, "Pod information retrieved successfully")
+
+	// Compute and display diff in watch mode
+	if m.Config.Watch {
+		currentPods, err := parsePods(getPodsOutput, topPodsOutput, m.Config)
+		if err == nil {
+			currentMap := podsToMap(currentPods)
+			if m.previousPods != nil {
+				diff := diffPods(m.previousPods, currentMap)
+				if diff.HasChanges() {
+					m.printDiff(diff)
+				}
+			}
+			m.previousPods = currentMap
+		}
+	}
 
 	return renderTable(getPodsOutput, topPodsOutput, m.Config)
 }
@@ -1246,6 +1507,13 @@ func parsePods(getPodsOutput, topPodsOutput string, config *Config) ([]PodData, 
 		if config.ProblemsOnly {
 			if status == StatusRunning && restarts == 0 {
 				continue // Skip healthy pods
+			}
+		}
+
+		// Filter by --since: only pods created within the given duration
+		if config.Since > 0 && !ageTime.IsZero() {
+			if !ageTime.After(time.Now().Add(-config.Since)) {
+				continue
 			}
 		}
 
